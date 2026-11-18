@@ -25,6 +25,9 @@ const (
 	metricResSuccess  = "success"
 	metricResRejected = "rejected"
 	metricResError    = "error"
+
+	cacheLookupHit  = "hit"
+	cacheLookupMiss = "miss"
 )
 
 // tokenExchangeMetrics holds metric IDs defined at config time, used at request time.
@@ -33,6 +36,10 @@ type tokenExchangeMetrics struct {
 	hasExchanges       bool
 	exchangeResults    shared.MetricID
 	hasExchangeResults bool
+	cacheLookups       shared.MetricID
+	hasCacheLookups    bool
+	cacheEvictions     shared.MetricID
+	hasCacheEvictions  bool
 }
 
 // tokenExchangeFilterFactory creates filter instances with the parsed config.
@@ -40,6 +47,7 @@ type tokenExchangeFilterFactory struct {
 	shared.EmptyHttpFilterFactory
 	config  *tokenExchangeConfig
 	metrics *tokenExchangeMetrics
+	cache   *tokenCache // nil when caching is disabled; shared across filter instances
 }
 
 func (f *tokenExchangeFilterFactory) Create(handle shared.HttpFilterHandle) shared.HttpFilter {
@@ -52,7 +60,7 @@ func (f *tokenExchangeFilterFactory) Create(handle shared.HttpFilterHandle) shar
 		return &shared.EmptyHttpFilter{}
 	}
 
-	return &tokenExchangeFilter{handle: handle, config: cfg, metrics: f.metrics}
+	return &tokenExchangeFilter{handle: handle, config: cfg, metrics: f.metrics, cache: f.cache}
 }
 
 // tokenExchangeHttpFilterConfigFactory is the configuration factory for the OAuth2 Token Exchange filter.
@@ -86,13 +94,27 @@ func (f *tokenExchangeHttpFilterConfigFactory) Create(handle shared.HttpFilterCo
 		metrics.hasExchangeResults = true
 	}
 
+	var cache *tokenCache
+	if cfg != nil && cfg.Cache != nil && cfg.Cache.Enabled {
+		cache = newTokenCache(cfg.Cache.MaxEntries)
+		if id, status := handle.DefineCounter("token_exchange_cache_lookups_total", "result"); status == shared.MetricsSuccess {
+			metrics.cacheLookups = id
+			metrics.hasCacheLookups = true
+		}
+		if id, status := handle.DefineCounter("token_exchange_cache_evictions_total", "reason"); status == shared.MetricsSuccess {
+			metrics.cacheEvictions = id
+			metrics.hasCacheEvictions = true
+		}
+	}
+
 	if cfg != nil {
 		handle.Log(shared.LogLevelInfo,
-			"token-exchange: loaded token exchange config for cluster=%s url=%s",
+			"token-exchange: loaded token exchange config for cluster=%s url=%s cache_enabled=%t",
 			cfg.Cluster,
-			cfg.TokenExchangeURL)
+			cfg.TokenExchangeURL,
+			cache != nil)
 	}
-	return &tokenExchangeFilterFactory{config: cfg, metrics: metrics}, nil
+	return &tokenExchangeFilterFactory{config: cfg, metrics: metrics, cache: cache}, nil
 }
 
 // CreatePerRoute parses per-route configuration for the token-exchange filter.
@@ -158,12 +180,34 @@ type tokenExchangeFilter struct {
 	handle  shared.HttpFilterHandle
 	config  *tokenExchangeConfig
 	metrics *tokenExchangeMetrics
+	cache   *tokenCache
 }
 
 // incrementExchanges increments the token exchanges counter.
 func (f *tokenExchangeFilter) incrementExchanges() {
 	if m := f.metrics; m != nil && m.hasExchanges {
 		f.handle.IncrementCounterValue(m.exchanges, 1)
+	}
+}
+
+func (f *tokenExchangeFilter) incrementCacheLookup(result string) {
+	if m := f.metrics; m != nil && m.hasCacheLookups {
+		f.handle.IncrementCounterValue(m.cacheLookups, 1, result)
+	}
+}
+
+func (f *tokenExchangeFilter) flushCacheEvictions() {
+	if f.cache == nil {
+		return
+	}
+	m := f.metrics
+	if m == nil || !m.hasCacheEvictions {
+		return
+	}
+	for reason, n := range f.cache.drainEvictions() {
+		if n > 0 {
+			f.handle.IncrementCounterValue(m.cacheEvictions, n, reason)
+		}
 	}
 }
 
@@ -188,13 +232,27 @@ func (f *tokenExchangeFilter) OnRequestHeaders(headers shared.HeaderMap, _ bool)
 		return sendLocalRespError(f.handle, shared.LogLevelWarn, http.StatusUnauthorized, "empty bearer token", nil)
 	}
 
+	var key string
+	if f.cache != nil {
+		key = cacheKey(f.config, subjectToken)
+		if tok, ok := f.cache.get(key); ok {
+			headers.Set("authorization", fmt.Sprintf("%s %s", tok.tokenType, tok.accessToken))
+			f.incrementCacheLookup(cacheLookupHit)
+			f.flushCacheEvictions()
+			f.handle.Log(shared.LogLevelDebug, "token-exchange: served exchanged token from cache")
+			return shared.HeadersStatusContinue
+		}
+		f.incrementCacheLookup(cacheLookupMiss)
+		f.flushCacheEvictions()
+	}
+
 	// The static form fields are precomputed at config time; only the subject token is dynamic.
 	result, _ := f.handle.HttpCallout(
 		f.config.Cluster,
 		f.config.calloutHeaders,
 		f.config.stsPostBody(subjectToken),
 		f.config.TimeoutMs,
-		&tokenExchangeCallback{handle: f.handle, metrics: f.metrics},
+		&tokenExchangeCallback{handle: f.handle, metrics: f.metrics, cache: f.cache, cacheKey: key, cacheCfg: f.config.Cache},
 	)
 	if result != shared.HttpCalloutInitSuccess {
 		return sendLocalRespError(f.handle, shared.LogLevelError, http.StatusBadGateway, "token exchange unavailable", nil)
@@ -207,8 +265,26 @@ func (f *tokenExchangeFilter) OnRequestHeaders(headers shared.HeaderMap, _ bool)
 
 // tokenExchangeCallback handles the STS endpoint response.
 type tokenExchangeCallback struct {
-	handle  shared.HttpFilterHandle
-	metrics *tokenExchangeMetrics
+	handle   shared.HttpFilterHandle
+	metrics  *tokenExchangeMetrics
+	cache    *tokenCache
+	cacheKey string
+	cacheCfg *cacheConfig
+}
+
+func (c *tokenExchangeCallback) maybeCache(tokenType, accessToken string, expiresIn int) {
+	if c.cache == nil || c.cacheCfg == nil {
+		return
+	}
+	ttl, ok := cacheLifetime(expiresIn, c.cacheCfg)
+	if !ok {
+		return
+	}
+	c.cache.set(c.cacheKey, cachedToken{
+		tokenType:   tokenType,
+		accessToken: accessToken,
+		expiresAt:   c.cache.now().Add(ttl),
+	})
 }
 
 // OnHttpCalloutDone is called when the STS response is received. It processes the response and either continues
@@ -255,6 +331,7 @@ func (c *tokenExchangeCallback) OnHttpCalloutDone(_ uint64, result shared.HttpCa
 		AccessToken     string `json:"access_token"`
 		TokenType       string `json:"token_type"`
 		IssuedTokenType string `json:"issued_token_type"`
+		ExpiresIn       int    `json:"expires_in"`
 	}
 
 	if err := json.Unmarshal(fullBody, &tokenResp); err != nil {
@@ -287,6 +364,9 @@ func (c *tokenExchangeCallback) OnHttpCalloutDone(_ uint64, result shared.HttpCa
 	reqHeaders := c.handle.RequestHeaders()
 	reqHeaders.Set("authorization", fmt.Sprintf("%s %s", tokenResp.TokenType, tokenResp.AccessToken))
 	c.incrementExchangeResult(metricResSuccess)
+
+	c.maybeCache(tokenResp.TokenType, tokenResp.AccessToken, tokenResp.ExpiresIn)
+
 	c.handle.Log(shared.LogLevelInfo, "token-exchange: token exchange succeeded, token_type=%s issued_token_type=%s", tokenResp.TokenType, tokenResp.IssuedTokenType)
 	c.handle.ContinueRequest()
 }

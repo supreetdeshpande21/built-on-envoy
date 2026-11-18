@@ -18,7 +18,17 @@ const (
 	defaultSubjectTokenType        = "urn:ietf:params:oauth:token-type:access_token"   // #nosec G101 -- not a credential.
 	grantTypeTokenExchange         = "urn:ietf:params:oauth:grant-type:token-exchange" // #nosec G101 -- not a credential.
 	defaultTimeoutMs        uint64 = 5000
+
+	defaultCacheMaxEntries = 1024
+	defaultCacheTTLSeconds = 300
 )
+
+// cacheConfig is the optional in-process cache of exchanged tokens (off when omitted/disabled).
+type cacheConfig struct {
+	Enabled    bool `json:"enabled"`
+	MaxEntries int  `json:"max_entries"`
+	TTLSeconds int  `json:"ttl_seconds"`
+}
 
 // tokenExchangeConfig holds the configuration for the OAuth2 Token Exchange
 // filter following the RFC 8693 (https://datatracker.ietf.org/doc/html/rfc8693).
@@ -57,6 +67,8 @@ type tokenExchangeConfig struct {
 
 	// HTTP callout timeout in milliseconds. Optional. Defaults to 5000.
 	TimeoutMs uint64 `json:"timeout_ms"`
+
+	Cache *cacheConfig `json:"cache"`
 
 	// tokenExchangeHost is extracted from TokenExchangeURL at config time.
 	tokenExchangeHost string
@@ -133,6 +145,14 @@ func parseConfig(data []byte) (*tokenExchangeConfig, error) {
 	if cfg.ActorToken != "" && cfg.ActorTokenType == "" {
 		errs = append(errs, fmt.Errorf("actor_token_type is required when actor_token is present"))
 	}
+	if cfg.Cache != nil && cfg.Cache.Enabled {
+		if cfg.Cache.MaxEntries < 0 {
+			errs = append(errs, fmt.Errorf("cache.max_entries must not be negative, got %d", cfg.Cache.MaxEntries))
+		}
+		if cfg.Cache.TTLSeconds < 0 {
+			errs = append(errs, fmt.Errorf("cache.ttl_seconds must not be negative, got %d", cfg.Cache.TTLSeconds))
+		}
+	}
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("token-exchange: %w", errors.Join(errs...))
 	}
@@ -143,6 +163,14 @@ func parseConfig(data []byte) (*tokenExchangeConfig, error) {
 	}
 	if cfg.TimeoutMs == 0 {
 		cfg.TimeoutMs = defaultTimeoutMs
+	}
+	if cfg.Cache != nil && cfg.Cache.Enabled {
+		if cfg.Cache.MaxEntries == 0 {
+			cfg.Cache.MaxEntries = defaultCacheMaxEntries
+		}
+		if cfg.Cache.TTLSeconds == 0 {
+			cfg.Cache.TTLSeconds = defaultCacheTTLSeconds
+		}
 	}
 
 	// Precompute fixed values derived from the config

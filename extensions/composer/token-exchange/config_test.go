@@ -222,6 +222,84 @@ func TestConfigFactory(t *testing.T) {
 	})
 }
 
+func TestCacheConfig(t *testing.T) {
+	t.Run("disabled by default when omitted", func(t *testing.T) {
+		cfg, err := parseConfig(marshalJSON(t, baseConfig()))
+		require.NoError(t, err)
+		require.Nil(t, cfg.Cache)
+	})
+
+	t.Run("defaults applied when enabled", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Cache = &cacheConfig{Enabled: true}
+		parsed, err := parseConfig(marshalJSON(t, cfg))
+		require.NoError(t, err)
+		require.NotNil(t, parsed.Cache)
+		require.Equal(t, defaultCacheMaxEntries, parsed.Cache.MaxEntries)
+		require.Equal(t, defaultCacheTTLSeconds, parsed.Cache.TTLSeconds)
+	})
+
+	t.Run("explicit values preserved", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Cache = &cacheConfig{Enabled: true, MaxEntries: 100, TTLSeconds: 60}
+		parsed, err := parseConfig(marshalJSON(t, cfg))
+		require.NoError(t, err)
+		require.Equal(t, 100, parsed.Cache.MaxEntries)
+		require.Equal(t, 60, parsed.Cache.TTLSeconds)
+	})
+
+	t.Run("not validated when disabled", func(t *testing.T) {
+		cfg := baseConfig()
+		cfg.Cache = &cacheConfig{Enabled: false, MaxEntries: -5}
+		_, err := parseConfig(marshalJSON(t, cfg))
+		require.NoError(t, err)
+	})
+
+	t.Run("invalid values rejected", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			cache   *cacheConfig
+			errPart string
+		}{
+			{"negative max_entries", &cacheConfig{Enabled: true, MaxEntries: -1}, "max_entries"},
+			{"negative ttl", &cacheConfig{Enabled: true, TTLSeconds: -1}, "ttl_seconds"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				cfg := baseConfig()
+				cfg.Cache = tt.cache
+				_, err := parseConfig(marshalJSON(t, cfg))
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.errPart)
+			})
+		}
+	})
+
+	t.Run("factory builds cache when enabled", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		cfg := baseConfig()
+		cfg.Cache = &cacheConfig{Enabled: true}
+		factory := &tokenExchangeHttpFilterConfigFactory{}
+		ff, err := factory.Create(newMockConfigHandle(ctrl), marshalJSON(t, cfg))
+		require.NoError(t, err)
+		tff := ff.(*tokenExchangeFilterFactory)
+		require.NotNil(t, tff.cache)
+	})
+
+	t.Run("factory has no cache when disabled", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		factory := &tokenExchangeHttpFilterConfigFactory{}
+		ff, err := factory.Create(newMockConfigHandle(ctrl), marshalJSON(t, baseConfig()))
+		require.NoError(t, err)
+		tff := ff.(*tokenExchangeFilterFactory)
+		require.Nil(t, tff.cache)
+	})
+}
+
 func TestParseTokenExchangeURL(t *testing.T) {
 	tests := []struct {
 		name     string

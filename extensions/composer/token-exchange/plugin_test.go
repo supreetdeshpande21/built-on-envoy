@@ -40,6 +40,10 @@ func testMetrics() *tokenExchangeMetrics {
 		hasExchanges:       true,
 		exchangeResults:    shared.MetricID(2),
 		hasExchangeResults: true,
+		cacheLookups:       shared.MetricID(3),
+		hasCacheLookups:    true,
+		cacheEvictions:     shared.MetricID(4),
+		hasCacheEvictions:  true,
 	}
 }
 
@@ -390,6 +394,54 @@ func TestFullExchange(t *testing.T) {
 	status := f.OnRequestHeaders(reqHeaders, false)
 	require.Equal(t, shared.HeadersStatusStopAllAndBuffer, status)
 	require.Equal(t, "Bearer new-token", reqHeaders.GetOne("authorization").ToUnsafeString())
+}
+
+// TestCachedExchange verifies that once a token has been exchanged and cached,
+// a subsequent request with the same subject token is served from the cache
+// without a second STS callout.
+func TestCachedExchange(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockHandle := newMockFilterHandle(ctrl)
+
+	cfg := mustParseConfig(t, &tokenExchangeConfig{
+		Cluster:          "cluster",
+		TokenExchangeURL: "host/path",
+		ClientID:         "client",
+		ClientSecret:     "client-secret",
+		Cache:            &cacheConfig{Enabled: true, TTLSeconds: 300},
+	})
+
+	cache := newTokenCache(cfg.Cache.MaxEntries)
+	f := &tokenExchangeFilter{handle: mockHandle, config: cfg, metrics: testMetrics(), cache: cache}
+
+	mockHandle.EXPECT().HttpCallout(
+		gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+	).Do(func(_ string, _ [][2]string, _ []byte, _ uint64, cb shared.HttpCalloutCallback) {
+		cb.OnHttpCalloutDone(0, shared.HttpCalloutSuccess,
+			[][2]shared.UnsafeEnvoyBuffer{{pkg.UnsafeBufferFromString(":status"), pkg.UnsafeBufferFromString("200")}},
+			[]shared.UnsafeEnvoyBuffer{pkg.UnsafeBufferFromString(`{"access_token":"new-token","token_type":"Bearer","issued_token_type":"urn:ietf:params:oauth:token-type:access_token","expires_in":3600}`)},
+		)
+	}).Return(shared.HttpCalloutInitSuccess, uint64(1))
+
+	reqHeaders1 := fake.NewFakeHeaderMap(map[string][]string{"authorization": {"Bearer original"}})
+	mockHandle.EXPECT().IncrementCounterValue(f.metrics.cacheLookups, uint64(1), cacheLookupMiss).Return(shared.MetricsSuccess)
+	mockHandle.EXPECT().IncrementCounterValue(f.metrics.exchanges, uint64(1)).Return(shared.MetricsSuccess)
+	mockHandle.EXPECT().IncrementCounterValue(f.metrics.exchangeResults, uint64(1), "success").Return(shared.MetricsSuccess)
+	mockHandle.EXPECT().RequestHeaders().Return(reqHeaders1)
+	mockHandle.EXPECT().ContinueRequest()
+
+	status := f.OnRequestHeaders(reqHeaders1, false)
+	require.Equal(t, shared.HeadersStatusStopAllAndBuffer, status)
+	require.Equal(t, "Bearer new-token", reqHeaders1.GetOne("authorization").ToUnsafeString())
+	require.Equal(t, 1, cache.len())
+
+	reqHeaders2 := fake.NewFakeHeaderMap(map[string][]string{"authorization": {"Bearer original"}})
+	mockHandle.EXPECT().IncrementCounterValue(f.metrics.cacheLookups, uint64(1), cacheLookupHit).Return(shared.MetricsSuccess)
+
+	status = f.OnRequestHeaders(reqHeaders2, false)
+	require.Equal(t, shared.HeadersStatusContinue, status)
+	require.Equal(t, "Bearer new-token", reqHeaders2.GetOne("authorization").ToUnsafeString())
 }
 
 func newFilterHandleWithoutPerRouteConfig(ctrl *gomock.Controller) *mocks.MockHttpFilterHandle {

@@ -22,7 +22,10 @@ longDescription: |
   * **RFC 8693 Compliant**: Token exchange implementation with all optional parameters.
   * **Impersonation & Delegation**: Supports both semantics - omit `actor_token` for impersonation,
     include it for delegation.
-  * **RFC Error Parsing**: Parses and logs error descriptions optionally returned by the STS. 
+  * **RFC Error Parsing**: Parses and logs error descriptions optionally returned by the STS.
+  * **Optional in-process token cache**: Reuses a previously exchanged token until shortly before
+    it expires, avoiding an STS callout on every request. Bounded (LRU) and TTL'd; in-memory only,
+    no external store. Off by default.
 
   ## How It Works
 
@@ -48,6 +51,22 @@ longDescription: |
   - `actor_token` / `actor_token_type`: For delegation semantics (both required together)
   - `subject_token_type`: Input token type (defaults to `urn:ietf:params:oauth:token-type:access_token`)
   - `timeout_ms`: HTTP callout timeout in milliseconds (defaults to `5000`)
+  - `cache`: Optional in-process token cache (see below)
+
+  ## Caching
+
+  When enabled, the filter caches exchanged tokens in process memory and reuses them until
+  shortly before they expire, avoiding an STS callout per request. The cache is a bounded,
+  in-memory LRU with TTL. It is off by default; omit the `cache` block (or set
+  `enabled: false`) to keep the exchange-on-every-request behaviour.
+
+  Cache fields (all optional):
+  - `enabled`: turn the cache on (default `false`)
+  - `max_entries`: LRU capacity per Envoy process (default `1024`)
+  - `ttl_seconds`: upper bound on an entry's lifetime; never extends beyond the STS `expires_in` (default `300`)
+
+  An entry's lifetime is `min(expires_in, ttl_seconds)`. The cache key is
+  `hash(subject_token + audience + sorted(scopes))`.
 
   ## Metrics
 
@@ -57,6 +76,8 @@ longDescription: |
   |--------|------|------|-------------|
   | `token_exchange_requests_total` | Counter | - | Incremented on each token exchange callout initiated |
   | `token_exchange_results_total` | Counter | `result` (`success` / `rejected` / `error`) | Incremented after the STS response is processed |
+  | `token_exchange_cache_lookups_total` | Counter | `result` (`hit` / `miss` / `skip`) | Incremented on each cache lookup (only when the cache is enabled) |
+  | `token_exchange_cache_evictions_total` | Counter | `reason` (`lru` / `expired`) | Incremented when an entry is evicted (only when the cache is enabled) |
 type: go
 tags:
   - oauth2

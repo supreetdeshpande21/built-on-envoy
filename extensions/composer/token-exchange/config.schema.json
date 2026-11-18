@@ -59,6 +59,27 @@
       "type": "integer",
       "description": "HTTP callout timeout in milliseconds. Defaults to 5000.",
       "minimum": 0
+    },
+    "cache": {
+      "type": "object",
+      "description": "Optional in-process cache of exchanged tokens. When omitted or disabled, the STS is called on every request.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable the in-process token cache. Defaults to false."
+        },
+        "max_entries": {
+          "type": "integer",
+          "description": "LRU capacity (entries per Envoy process). 0 uses the default of 1024.",
+          "minimum": 0
+        },
+        "ttl_seconds": {
+          "type": "integer",
+          "description": "Upper bound on an entry's lifetime in seconds. Never extends beyond the STS expires_in. 0 uses the default of 300.",
+          "minimum": 0
+        }
+      }
     }
   }
 }
