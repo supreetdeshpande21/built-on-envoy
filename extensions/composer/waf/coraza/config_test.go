@@ -7,6 +7,7 @@ package coraza
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -102,6 +103,50 @@ func TestGetOrCreateSharedWAFFromConfig(t *testing.T) {
 		require.Nil(t, waf)
 	})
 
+	t.Run("crs_version", func(t *testing.T) {
+		directives := []string{
+			"Include @coraza.conf",
+			"Include @crs-setup.conf",
+			"Include @owasp_crs/*.conf",
+		}
+		get := func(t *testing.T, crsVersion string) *SharedWAF {
+			t.Helper()
+			config := map[string]interface{}{"directives": directives}
+			if crsVersion != "" {
+				config["crs_version"] = crsVersion
+			}
+			wafConfig, _ := json.Marshal(config)
+			waf, _, _, err := GetOrCreateSharedWAFFromConfig(wafConfig, logger.GetLogger())
+			require.NoError(t, err)
+			return waf
+		}
+
+		// Keep the WAFs reachable, so that the shared ones are not collected mid-test.
+		defaultWAF, lts, latest := get(t, ""), get(t, "lts"), get(t, "latest")
+		// The default is the LTS release.
+		require.Same(t, defaultWAF, lts)
+		// Same directives against another CRS version must not share the WAF.
+		require.NotSame(t, lts, latest)
+		require.Same(t, latest, get(t, "latest"))
+	})
+
+	t.Run("invalid crs_version", func(t *testing.T) {
+		// Only the aliases are accepted: the embedded versions are not exposed.
+		for _, v := range []string{"4.30.0", "4.25.2", "4", "4.25", "4.30", "4.26.0", "9.9.9", "v4.30.0", "LTS", "stable"} {
+			t.Run(v, func(t *testing.T) {
+				config := map[string]interface{}{
+					"directives":  []string{"Include @coraza.conf"},
+					"crs_version": v,
+				}
+				wafConfig, _ := json.Marshal(config)
+
+				waf, _, _, err := GetOrCreateSharedWAFFromConfig(wafConfig, logger.GetLogger())
+				require.EqualError(t, err, fmt.Sprintf("unsupported crs_version %q, supported values are: latest (4.30.0), lts (4.25.2)", v))
+				require.Nil(t, waf)
+			})
+		}
+	})
+
 	t.Run("error", func(t *testing.T) {
 		config := map[string]interface{}{
 			"directives": []string{
@@ -115,4 +160,29 @@ func TestGetOrCreateSharedWAFFromConfig(t *testing.T) {
 		require.ErrorContains(t, err, "failed to create WAF")
 		require.Nil(t, waf)
 	})
+}
+
+func TestParseConfigCRSVersion(t *testing.T) {
+	set := mustCRSBundles(t)
+	byVersion := func(v string) *crsBundle {
+		b := set.byVersion(v)
+		require.NotNil(t, b, v)
+		return b
+	}
+	for _, tc := range []struct {
+		version  string
+		expected *crsBundle
+	}{
+		// The CRS LTS release is the default.
+		{version: "", expected: byVersion("4.25.2")},
+		{version: "latest", expected: byVersion("4.30.0")},
+		{version: "lts", expected: byVersion("4.25.2")},
+	} {
+		t.Run(tc.version, func(t *testing.T) {
+			raw, _ := json.Marshal(map[string]any{"directives": []string{"SecRuleEngine On"}, "crs_version": tc.version})
+			cfg, err := parseConfig(raw, logger.GetLogger())
+			require.NoError(t, err)
+			require.Same(t, tc.expected, cfg.CRS)
+		})
+	}
 }

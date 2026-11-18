@@ -24,6 +24,11 @@
     "request_uri_path_only": {
       "type": "boolean",
       "description": "Set REQUEST_URI to the request path and query (e.g. \"/api?x=1\") instead of the absolute URL (e.g. \"https://example.com/api?x=1\"). Defaults to false. The default will change to true in a future release."
+    },
+    "crs_version": {
+      "type": "string",
+      "description": "OWASP CRS version served under @owasp_crs/, @crs-setup.conf and @crs-setup.conf.example: \"lts\" (the CRS LTS release, the default) or \"latest\" (the newest CRS release). Each extension release embeds the newest release of both, so an extension upgrade can move them to a newer CRS version.",
+      "enum": ["lts", "latest"]
     }
   }
 }

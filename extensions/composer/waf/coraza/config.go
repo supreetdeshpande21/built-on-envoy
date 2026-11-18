@@ -45,6 +45,8 @@ type parsedConfig struct {
 	Mode       WAFMode
 	// RequestURIPathOnly sets REQUEST_URI to the path and query instead of the absolute URL.
 	RequestURIPathOnly bool
+	// CRS is the CRS version the directives are resolved against.
+	CRS *crsBundle
 }
 
 // parseConfig parses the raw configuration bytes passed at the Envoy filter configuration.
@@ -56,6 +58,7 @@ func parseConfig(configBytes []byte, l *zap.Logger) (parsedConfig, error) {
 		Directives         []string `json:"directives"`
 		ModeString         string   `json:"mode"`
 		RequestURIPathOnly *bool    `json:"request_uri_path_only,omitempty"`
+		CRSVersion         string   `json:"crs_version,omitempty"`
 	}
 	if err := json.Unmarshal(configBytes, &y); err != nil {
 		return parsedConfig{}, fmt.Errorf("failed to unmarshal config: %w", err)
@@ -82,24 +85,34 @@ func parseConfig(configBytes []byte, l *zap.Logger) (parsedConfig, error) {
 		requestURIPathOnly = *y.RequestURIPathOnly
 	}
 
+	crsBundle, err := lookupCRSBundle(y.CRSVersion)
+	if err != nil {
+		return parsedConfig{}, err
+	}
+	if y.CRSVersion != crsBundle.version {
+		// An alias or the default: show which CRS version it selects, since upgrades can move it.
+		l.Info("using OWASP CRS "+crsBundle.version, zap.String("crs_version", y.CRSVersion))
+	}
+
 	// Join directives with newlines
 	return parsedConfig{
 		Directives:         strings.Join(y.Directives, "\n"),
 		Mode:               mode,
 		RequestURIPathOnly: requestURIPathOnly,
+		CRS:                crsBundle,
 	}, nil
 }
 
 // GetOrCreateSharedWAFFromConfig parses the raw configuration bytes passed at the Envoy filter
 // configuration and returns its WAF, mode and whether REQUEST_URI is the path only. The WAF is
-// shared: a live one built from the same directives is reused if the files it was built from are
-// unchanged.
+// shared: a live one built from the same directives and CRS version is reused if the files it was
+// built from are unchanged.
 func GetOrCreateSharedWAFFromConfig(configBytes []byte, l *zap.Logger) (*SharedWAF, WAFMode, bool, error) {
 	cfg, err := parseConfig(configBytes, l)
 	if err != nil {
 		return nil, 0, false, err
 	}
-	sharedWAF, err := sharedWAFs.getOrCreate(cfg.Directives, l, combinedDirectivesFS)
+	sharedWAF, err := cfg.CRS.wafs.getOrCreate(cfg.Directives, l, cfg.CRS.fs)
 	if err != nil {
 		return nil, 0, false, err
 	}
