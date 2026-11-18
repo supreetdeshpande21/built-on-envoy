@@ -262,16 +262,6 @@ func registeredCRS(t *testing.T, version string) crsregistry.Entry {
 	return crsregistry.Entry{}
 }
 
-// byVersion returns the bundle of a registered CRS version, or nil.
-func (s *crsBundleSet) byVersion(version string) *crsBundle {
-	for _, b := range s.bundles {
-		if b.version == version {
-			return b
-		}
-	}
-	return nil
-}
-
 // versions returns the registered CRS versions, newest first.
 func (s *crsBundleSet) versions() []string {
 	versions := make([]string, 0, len(s.bundles))

@@ -6,7 +6,6 @@
 package coraza
 
 import (
-	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -17,106 +16,28 @@ import (
 
 func TestGetOrCreateSharedWAFFromConfig(t *testing.T) {
 	t.Run("ok", func(t *testing.T) {
-		config := map[string]interface{}{
-			"directives": []string{
-				"Include @coraza.conf",
-				"Include @ftw.conf",
-				"Include @crs-setup.conf",
-				"Include @owasp_crs/*.conf",
-			},
-		}
+		cfg := Config{Directives: "Include @coraza.conf\nInclude @ftw.conf\nInclude @crs-setup.conf\nInclude @owasp_crs/*.conf"}
 
-		// Convert map to JSON bytes
-		wafConfig, _ := json.Marshal(config)
-
-		waf, mode, _, err := GetOrCreateSharedWAFFromConfig(wafConfig, logger.GetLogger())
+		waf, err := GetOrCreateSharedWAFFromConfig(cfg, logger.GetLogger())
 		require.NoError(t, err)
 		require.NotNil(t, waf)
-		// REQUEST_ONLY is the default when no mode is set.
-		require.Equal(t, ModeRequestOnly, mode)
 	})
 
-	t.Run("explicit mode", func(t *testing.T) {
-		for _, tc := range []struct {
-			name     string
-			modeStr  string
-			expected WAFMode
-		}{
-			{"request_only", "REQUEST_ONLY", ModeRequestOnly},
-			{"full", "FULL", ModeFull},
-			// RESPONSE_ONLY is deprecated but must still parse for backward compatibility.
-			{"response_only_deprecated", "RESPONSE_ONLY", ModeResponseOnly},
-		} {
-			t.Run(tc.name, func(t *testing.T) {
-				config := map[string]interface{}{
-					"directives": []string{
-						"Include @coraza.conf",
-						"Include @ftw.conf",
-						"Include @crs-setup.conf",
-						"Include @owasp_crs/*.conf",
-					},
-					"mode": tc.modeStr,
-				}
-				wafConfig, _ := json.Marshal(config)
+	t.Run("shared by directives", func(t *testing.T) {
+		cfg := Config{Directives: "Include @coraza.conf"}
 
-				waf, mode, _, err := GetOrCreateSharedWAFFromConfig(wafConfig, logger.GetLogger())
-				require.NoError(t, err)
-				require.NotNil(t, waf)
-				require.Equal(t, tc.expected, mode)
-			})
-		}
-	})
-
-	t.Run("request_uri_path_only", func(t *testing.T) {
-		for _, tc := range []struct {
-			name     string
-			value    any
-			expected bool
-		}{
-			{"unset", nil, defaultRequestURIPathOnly},
-			{"true", true, true},
-			{"false", false, false},
-		} {
-			t.Run(tc.name, func(t *testing.T) {
-				config := map[string]interface{}{"directives": []string{"Include @coraza.conf"}}
-				if tc.value != nil {
-					config["request_uri_path_only"] = tc.value
-				}
-				wafConfig, _ := json.Marshal(config)
-
-				_, _, pathOnly, err := GetOrCreateSharedWAFFromConfig(wafConfig, logger.GetLogger())
-				require.NoError(t, err)
-				require.Equal(t, tc.expected, pathOnly)
-			})
-		}
-	})
-
-	t.Run("invalid mode", func(t *testing.T) {
-		config := map[string]interface{}{
-			"directives": []string{"Include @coraza.conf"},
-			"mode":       "SIDEWAYS",
-		}
-		wafConfig, _ := json.Marshal(config)
-
-		waf, _, _, err := GetOrCreateSharedWAFFromConfig(wafConfig, logger.GetLogger())
-		require.ErrorContains(t, err, "invalid mode")
-		require.Nil(t, waf)
+		first, err := GetOrCreateSharedWAFFromConfig(cfg, logger.GetLogger())
+		require.NoError(t, err)
+		second, err := GetOrCreateSharedWAFFromConfig(cfg, logger.GetLogger())
+		require.NoError(t, err)
+		require.Same(t, first, second)
 	})
 
 	t.Run("crs_version", func(t *testing.T) {
-		directives := []string{
-			"Include @coraza.conf",
-			"Include @crs-setup.conf",
-			"Include @owasp_crs/*.conf",
-		}
+		directives := "Include @coraza.conf\nInclude @crs-setup.conf\nInclude @owasp_crs/*.conf"
 		get := func(t *testing.T, crsVersion string) *SharedWAF {
 			t.Helper()
-			config := map[string]interface{}{"directives": directives}
-			if crsVersion != "" {
-				config["crs_version"] = crsVersion
-			}
-			wafConfig, _ := json.Marshal(config)
-			waf, _, _, err := GetOrCreateSharedWAFFromConfig(wafConfig, logger.GetLogger())
+			waf, err := GetOrCreateSharedWAFFromConfig(Config{Directives: directives, CRSVersion: crsVersion}, logger.GetLogger())
 			require.NoError(t, err)
 			return waf
 		}
@@ -134,13 +55,7 @@ func TestGetOrCreateSharedWAFFromConfig(t *testing.T) {
 		// Only the aliases are accepted: the embedded versions are not exposed.
 		for _, v := range []string{"4.30.0", "4.25.2", "4", "4.25", "4.30", "4.26.0", "9.9.9", "v4.30.0", "LTS", "stable"} {
 			t.Run(v, func(t *testing.T) {
-				config := map[string]interface{}{
-					"directives":  []string{"Include @coraza.conf"},
-					"crs_version": v,
-				}
-				wafConfig, _ := json.Marshal(config)
-
-				waf, _, _, err := GetOrCreateSharedWAFFromConfig(wafConfig, logger.GetLogger())
+				waf, err := GetOrCreateSharedWAFFromConfig(Config{Directives: "Include @coraza.conf", CRSVersion: v}, logger.GetLogger())
 				require.EqualError(t, err, fmt.Sprintf("unsupported crs_version %q, supported values are: latest (4.30.0), lts (4.25.2)", v))
 				require.Nil(t, waf)
 			})
@@ -148,41 +63,8 @@ func TestGetOrCreateSharedWAFFromConfig(t *testing.T) {
 	})
 
 	t.Run("error", func(t *testing.T) {
-		config := map[string]interface{}{
-			"directives": []string{
-				"foo",
-			},
-		}
-		// Convert map to JSON bytes
-		wafConfig, _ := json.Marshal(config)
-
-		waf, _, _, err := GetOrCreateSharedWAFFromConfig(wafConfig, logger.GetLogger())
+		waf, err := GetOrCreateSharedWAFFromConfig(Config{Directives: "foo"}, logger.GetLogger())
 		require.ErrorContains(t, err, "failed to create WAF")
 		require.Nil(t, waf)
 	})
-}
-
-func TestParseConfigCRSVersion(t *testing.T) {
-	set := mustCRSBundles(t)
-	byVersion := func(v string) *crsBundle {
-		b := set.byVersion(v)
-		require.NotNil(t, b, v)
-		return b
-	}
-	for _, tc := range []struct {
-		version  string
-		expected *crsBundle
-	}{
-		// The CRS LTS release is the default.
-		{version: "", expected: byVersion("4.25.2")},
-		{version: "latest", expected: byVersion("4.30.0")},
-		{version: "lts", expected: byVersion("4.25.2")},
-	} {
-		t.Run(tc.version, func(t *testing.T) {
-			raw, _ := json.Marshal(map[string]any{"directives": []string{"SecRuleEngine On"}, "crs_version": tc.version})
-			cfg, err := parseConfig(raw, logger.GetLogger())
-			require.NoError(t, err)
-			require.Same(t, tc.expected, cfg.CRS)
-		})
-	}
 }
